@@ -9,18 +9,26 @@ const readline = require('readline');
 const port = process.env.PORT || 5000;
 const sessionId = 'default';
 const msgRetryCounterMap = new Map();
-const pairingCodePrefix = "RICHGANG"; 
-const newsletterJid = "120363424536255731@newsletter";
+const pairingCodePrefix = 'RICHGANG';
+const newsletterJid = '120363424536255731@newsletter';
+let activeSock = null;
+let startPromise = null;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let selectedPairMode = null;
+let pairingTargetNumber = '';
+let lastQrValue = null;
+let socketGeneration = 0;
 
 // --- 🔇 GLOBAL CONSOLE SILENCER (REVAMPED) 🔇 ---
 const interceptLogs = async () => {
     const { default: chalk } = await import('chalk');
-    
+
     const NOISE_PATTERNS = [
-        'Bad MAC', 
-        'Session error', 
-        'session', 
-        'Closing connection', 
+        'Bad MAC',
+        'Session error',
+        'session',
+        'Closing connection',
         'Stream error',
         'conflict',
         'unexpected-disconnect',
@@ -43,7 +51,7 @@ const interceptLogs = async () => {
             }).join(' ');
 
             if (NOISE_PATTERNS.some(p => msg.toLowerCase().includes(p.toLowerCase()))) {
-                return; 
+                return;
             }
 
             const match = REPLACEMENTS.find(r => msg.includes(r.pattern));
@@ -68,6 +76,78 @@ const dynamicImport = new Function('modulePath', 'return import(modulePath)');
 const sanitizeNumberDigits = (x = '') => String(x).replace(/\D/g, '');
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const ask = (q) => new Promise(res => rl.question(q, ans => res(ans.trim())));
+
+const clearReconnectTimer = () => {
+    if (!reconnectTimer) return;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+};
+
+const getReconnectDelay = () => Math.min(3000 + (reconnectAttempts * 2000), 15000);
+
+const closeSocket = async (sock) => {
+    if (!sock) return;
+
+    try {
+        sock.ev.removeAllListeners();
+    } catch (e) {}
+
+    try {
+        sock.end?.(undefined);
+    } catch (e) {}
+
+    try {
+        sock.ws?.close?.();
+    } catch (e) {}
+};
+
+const scheduleReconnect = (startSystem, reasonLabel = 'connection closed') => {
+    if (reconnectTimer || startPromise) return;
+
+    reconnectAttempts += 1;
+    const delayMs = getReconnectDelay();
+    console.log(`[CONNECTION] ${reasonLabel} -> scheduling reconnect in ${Math.ceil(delayMs / 1000)}s`);
+
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        startSystem().catch(() => {});
+    }, delayMs);
+};
+
+const askPairMode = async (chalk) => {
+    while (true) {
+        console.log(chalk.redBright('\n  [!] PAIRING AUTHORIZATION REQUIRED'));
+        console.log(chalk.gray('  ┌──────────────────────────────────┐'));
+        console.log(chalk.white('  │ ') + chalk.cyanBright('HOW BEST SHOULD WE PAIR?'));
+        console.log(chalk.white('  │ ') + chalk.greenBright('1. QR CODE'));
+        console.log(chalk.white('  │ ') + chalk.yellowBright('2. PAIR CODE'));
+        const answer = await ask(chalk.white('  │ ') + chalk.greenBright('SELECT OPTION ▶ '));
+        console.log(chalk.gray('  └──────────────────────────────────┘'));
+
+        if (answer === '1') return 'qr';
+        if (answer === '2') return 'pair';
+
+        console.log(chalk.red('  [-] INVALID SELECTION. ENTER 1 OR 2.'));
+    }
+};
+
+const askPairNumber = async (chalk) => {
+    while (true) {
+        console.log(chalk.gray('  ┌──────────────────────────────────┐'));
+        const phoneNumber = sanitizeNumberDigits(await ask(chalk.white('  │ ') + chalk.greenBright('TARGET NUMBER ▶ ')));
+        console.log(chalk.gray('  └──────────────────────────────────┘'));
+
+        if (phoneNumber && phoneNumber.length >= 8) return phoneNumber;
+        console.log(chalk.red('  [-] INVALID NUMBER. TRY AGAIN.'));
+    }
+};
+
+const printQrCode = (chalk, qr) => {
+    if (!qr || qr === lastQrValue) return;
+    lastQrValue = qr;
+    console.log(chalk.cyanBright('\n  📱 QR RECEIVED BELOW. SCAN IT WITH WHATSAPP.'));
+    console.log(chalk.gray('  ──────────────────────────────────────────────────────────────'));
+};
 
 // --- 🚀 MAIN ---
 (async () => {
@@ -113,144 +193,152 @@ const ask = (q) => new Promise(res => rl.question(q, ans => res(ans.trim())));
     } = baileys;
 
     const startSystem = async () => {
-        const authDir = path.join(__dirname, 'sessions', sessionId);
-        if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
+        if (startPromise) return startPromise;
 
-        const { state, saveCreds } = await useMultiFileAuthState(authDir);
-        const { version } = await fetchLatestBaileysVersion();
+        startPromise = (async () => {
+            clearReconnectTimer();
+            lastQrValue = null;
 
-        const sock = makeWASocket({
-            version,
-            logger: P({ level: 'silent' }),
-            printQRInTerminal: false,
-            browser: ['Ubuntu', 'Chrome', '20.0.04'],
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, P({ level: 'fatal' }))
-            },
-            msgRetryCounterCache: msgRetryCounterMap,
-            syncFullHistory: false,
-            markOnlineOnConnect: true,
-            connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 0,
-            keepAliveIntervalMs: 10000
-        });
+            const oldSock = activeSock;
+            activeSock = null;
+            await closeSocket(oldSock);
 
-        // --- 🛡️ ROBUST PAIRING FLOW ---
-        if (!sock.authState.creds.registered) {
-            console.log(chalk.redBright('\n  [!] PAIRING AUTHORIZATION REQUIRED'));
-            console.log(chalk.gray('  ┌──────────────────────────────────┐'));
-            const phoneNumber = sanitizeNumberDigits(await ask(chalk.white('  │ ') + chalk.greenBright('TARGET NUMBER ▶ ')));
-            console.log(chalk.gray('  └──────────────────────────────────┘'));
-            
-            if (!phoneNumber || phoneNumber.length < 8) {
-                console.log(chalk.red('  [-] INVALID SEQUENCE. REBOOTING...'));
-                return startSystem();
+            const authDir = path.join(__dirname, 'sessions', sessionId);
+            if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
+
+            const { state, saveCreds } = await useMultiFileAuthState(authDir);
+            const { version } = await fetchLatestBaileysVersion();
+
+            if (!state.creds.registered && !selectedPairMode) {
+                selectedPairMode = await askPairMode(chalk);
             }
 
-            await delay(5000); 
-
-            try {
-                let codeFetched = false;
-                let attempts = 0;
-
-                while (!codeFetched && attempts < 3) {
-                    try {
-                        attempts++;
-                        const code = await sock.requestPairingCode(phoneNumber, pairingCodePrefix);
-                        if (code) {
-                            console.log(chalk.cyan('\n  💠 KEY DECRYPTED SUCCESSFULY'));
-                            console.log(chalk.gray('  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓'));
-                            console.log(chalk.white('  ┃  PAIRING CODE: ') + chalk.yellowBright(code?.match(/.{1,4}/g)?.join('-') || code) + chalk.white('  ┃'));
-                            console.log(chalk.gray('  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛'));
-                            codeFetched = true;
-                        }
-                    } catch (err) {
-                        if (attempts >= 3) throw err;
-                        await delay(3000);
-                    }
-                }
-            } catch (e) {
-                console.error(chalk.red(`\n  [X] CRITICAL UPLINK FAILURE: ${e.message}`));
-                await delay(2000);
-                return startSystem();
+            if (!state.creds.registered && selectedPairMode === 'pair' && !pairingTargetNumber) {
+                pairingTargetNumber = await askPairNumber(chalk);
             }
-        }
 
-        sock.ev.on('creds.update', saveCreds);
+            const generation = ++socketGeneration;
+            const sock = makeWASocket({
+                version,
+                logger: P({ level: 'silent' }),
+                printQRInTerminal: selectedPairMode === 'qr',
+                browser: ['Chrome', 'Windows', '10.0'],
+                auth: {
+                    creds: state.creds,
+                    keys: makeCacheableSignalKeyStore(state.keys, P({ level: 'fatal' }))
+                },
+                msgRetryCounterCache: msgRetryCounterMap,
+                syncFullHistory: false,
+                downloadHistory: false,
+                markOnlineOnConnect: false,
+                connectTimeoutMs: 60000,
+                defaultQueryTimeoutMs: 0,
+                getMessage: async () => undefined
+            });
+            sock.__jb_generation = generation;
+            activeSock = sock;
 
-        sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
-            if (connection === 'open') {
-                console.log(chalk.greenBright('\n  [✓] PROTOCOL ESTABLISHED'));
-                console.log(chalk.cyan('  [+] TUNNEL STATUS: ') + chalk.whiteBright('STABLE'));
-                console.log(chalk.gray('  ──────────────────────────────────────────────────────────────\n'));
-
+            if (!sock.authState.creds.registered && selectedPairMode === 'pair' && pairingTargetNumber) {
                 try {
-                    await sock.newsletterFollow(newsletterJid);
-                    const messages = await sock.getNewsletterMessages(newsletterJid, 2);
-                    if (messages?.length > 0) {
-                        for (const msg of messages) {
-                            await sock.newsletterReactMessage(newsletterJid, msg.id, "🥳");
-                        }
-                    }
-                } catch (err) {}
+                    await delay(1500);
+                    const code = await sock.requestPairingCode(pairingTargetNumber, pairingCodePrefix);
+                    if (sock !== activeSock) return;
 
-                if (fs.existsSync('./socket.js')) {
-                    require('./socket').bindEvents(sock, chalk);
+                    console.log(chalk.cyan('\n  💠 KEY DECRYPTED SUCCESSFULLY'));
+                    console.log(chalk.gray('  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓'));
+                    console.log(chalk.white('  ┃  PAIRING CODE: ') + chalk.yellowBright(code?.match(/.{1,4}/g)?.join('-') || code) + chalk.white('  ┃'));
+                    console.log(chalk.gray('  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛'));
+                } catch (e) {
+                    if (sock === activeSock) {
+                        console.error(chalk.red(`\n  [X] PAIR CODE FAILURE: ${e.message}`));
+                        scheduleReconnect(startSystem, 'pair code request failed');
+                    }
                 }
-            } else if (connection === 'close') {
+            }
+
+            sock.ev.on('creds.update', saveCreds);
+
+            sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+                if (sock !== activeSock || sock.__jb_generation !== socketGeneration) return;
+
+                if (qr && selectedPairMode === 'qr') {
+                    printQrCode(chalk, qr);
+                }
+
+                if (connection === 'open') {
+                    reconnectAttempts = 0;
+                    lastQrValue = null;
+                    selectedPairMode = null;
+                    pairingTargetNumber = '';
+
+                    console.log(chalk.greenBright('\n  [✓] PROTOCOL ESTABLISHED'));
+                    console.log(chalk.cyan('  [+] TUNNEL STATUS: ') + chalk.whiteBright('STABLE'));
+                    console.log(chalk.gray('  ──────────────────────────────────────────────────────────────\n'));
+
+                    try {
+                        await sock.newsletterFollow(newsletterJid);
+                        const messages = await sock.getNewsletterMessages(newsletterJid, 2);
+                        if (messages?.length > 0) {
+                            for (const msg of messages) {
+                                await sock.newsletterReactMessage(newsletterJid, msg.id, '🥳');
+                            }
+                        }
+                    } catch (err) {}
+
+                    if (fs.existsSync('./socket.js')) {
+                        require('./socket').bindEvents(sock, chalk);
+                    }
+                    return;
+                }
+
+                if (connection !== 'close') return;
+
                 const code = lastDisconnect?.error?.output?.statusCode;
                 const shouldReconnect = code !== DisconnectReason.loggedOut;
 
+                if (activeSock === sock) {
+                    activeSock = null;
+                }
+
                 if (!shouldReconnect) {
                     console.log(chalk.red('  [!] SESSION OVERRIDE: TERMINATED'));
+                    selectedPairMode = null;
+                    pairingTargetNumber = '';
+                    lastQrValue = null;
                     fs.rmSync(authDir, { recursive: true, force: true });
                     process.exit(0);
-                } else {
-                    setTimeout(() => startSystem(), 3000);
                 }
-            }
+
+                const reasonLabel = code === DisconnectReason.connectionReplaced
+                    ? 'connection replaced'
+                    : code === DisconnectReason.restartRequired
+                        ? 'restart required'
+                        : `closed (code=${code || 'unknown'})`;
+
+                scheduleReconnect(startSystem, reasonLabel);
+            });
+
+            sock.ev.on('messages.upsert', async ({ messages, type }) => {
+                if (type !== 'notify') return;
+                for (const m of messages) {
+                    if (m.key.remoteJid === newsletterJid) {
+                        try {
+                            await sock.newsletterReactMessage(m.key.remoteJid, m.key.id, '🥳');
+                        } catch (e) {}
+                    }
+                }
+            });
+        })().finally(() => {
+            startPromise = null;
         });
 
-        sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            if (type !== 'notify') return;
-            for (const m of messages) {
-                if (m.key.remoteJid === newsletterJid) {
-                    try {
-                        await sock.newsletterReactMessage(m.key.remoteJid, m.key.id, "🥳");
-                    } catch (e) {}
-                }
-            }
-        });
-
-        // Start a watchdog to detect stale socket and trigger a reconnect (in-process)
-        sock.__jb_lastMessageAt = Date.now();
-        const WATCHDOG_INTERVAL = 30 * 1000; // check every 30s
-        const WATCHDOG_THRESHOLD = 2 * 60 * 1000; // 2 minutes of inactivity
-        sock.__jb_watchdog = setInterval(async () => {
-            try {
-                const age = Date.now() - (sock.__jb_lastMessageAt || 0);
-                if (age > WATCHDOG_THRESHOLD) {
-                    console.log(chalk.yellow('[WATCHDOG] Socket stale. Restarting connection...'));
-                    try { sock.ev.removeAllListeners(); } catch (e) {}
-                    try { clearInterval(sock.__jb_watchdog); } catch (e) {}
-                    try { sock.ws?.close(); } catch (e) {}
-                    try { await sock.logout(); } catch (e) {}
-                    // small delay then restart
-                    setTimeout(() => startSystem(), 1500);
-                }
-            } catch (e) {}
-        }, WATCHDOG_INTERVAL);
-
-        // clear watchdog on normal session termination
-        sock.ev.on('connection.update', ({ connection }) => {
-            if (connection === 'close' || connection === 'close') {
-                try { clearInterval(sock.__jb_watchdog); } catch (e) {}
-            }
-        });
+        return startPromise;
     };
 
-    startSystem();
+    startSystem().catch((err) => {
+        console.error(chalk.red(`  [BOOT FAILURE] ${err.message}`));
+        scheduleReconnect(startSystem, 'boot failure');
+    });
 })();
 
 process.on('uncaughtException', e => {
