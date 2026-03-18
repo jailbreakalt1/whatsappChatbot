@@ -1,6 +1,7 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 const express = require('express');
 const P = require('pino');
 const readline = require('readline');
@@ -13,12 +14,11 @@ const pairingCodePrefix = 'RICHGANG';
 const newsletterJid = '120363424536255731@newsletter';
 let activeSock = null;
 let startPromise = null;
-let reconnectTimer = null;
-let reconnectAttempts = 0;
 let selectedPairMode = null;
 let pairingTargetNumber = '';
 let lastQrValue = null;
 let socketGeneration = 0;
+let restartInProgress = false;
 
 // --- 🔇 GLOBAL CONSOLE SILENCER (REVAMPED) 🔇 ---
 const interceptLogs = async () => {
@@ -26,12 +26,6 @@ const interceptLogs = async () => {
 
     const NOISE_PATTERNS = [
         'Bad MAC',
-        'Session error',
-        'session',
-        'Closing connection',
-        'Stream error',
-        'conflict',
-        'unexpected-disconnect',
         'rate-overlimit'
     ];
 
@@ -77,16 +71,15 @@ const sanitizeNumberDigits = (x = '') => String(x).replace(/\D/g, '');
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const ask = (q) => new Promise(res => rl.question(q, ans => res(ans.trim())));
 
-const clearReconnectTimer = () => {
-    if (!reconnectTimer) return;
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-};
-
-const getReconnectDelay = () => Math.min(3000 + (reconnectAttempts * 2000), 15000);
-
 const closeSocket = async (sock) => {
     if (!sock) return;
+
+    try {
+        if (sock.__jb_watchdog) {
+            clearInterval(sock.__jb_watchdog);
+            sock.__jb_watchdog = null;
+        }
+    } catch (e) {}
 
     try {
         sock.ev.removeAllListeners();
@@ -99,19 +92,6 @@ const closeSocket = async (sock) => {
     try {
         sock.ws?.close?.();
     } catch (e) {}
-};
-
-const scheduleReconnect = (startSystem, reasonLabel = 'connection closed') => {
-    if (reconnectTimer || startPromise) return;
-
-    reconnectAttempts += 1;
-    const delayMs = getReconnectDelay();
-    console.log(`[CONNECTION] ${reasonLabel} -> scheduling reconnect in ${Math.ceil(delayMs / 1000)}s`);
-
-    reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        startSystem().catch(() => {});
-    }, delayMs);
 };
 
 const askPairMode = async (chalk) => {
@@ -147,6 +127,43 @@ const printQrCode = (chalk, qr) => {
     lastQrValue = qr;
     console.log(chalk.cyanBright('\n  📱 QR RECEIVED BELOW. SCAN IT WITH WHATSAPP.'));
     console.log(chalk.gray('  ──────────────────────────────────────────────────────────────'));
+};
+
+const touchHeartbeat = (sock, source) => {
+    if (!sock) return;
+    sock.__jb_lastHeartbeatAt = Date.now();
+    sock.__jb_lastHeartbeatSource = source;
+};
+
+const restartProcess = async (reason, sock, chalk) => {
+    if (restartInProgress) return;
+    restartInProgress = true;
+
+    console.log(chalk.yellow(`  [RESTART] ${reason}`));
+
+    try {
+        await closeSocket(sock || activeSock);
+    } catch (e) {}
+
+    const isSupervisorManaged = Boolean(
+        process.env.pm_id ||
+        process.env.NODE_APP_INSTANCE ||
+        process.env.JB_USE_EXTERNAL_RESTART === 'true'
+    );
+
+    if (isSupervisorManaged) {
+        process.exit(1);
+    }
+
+    const child = spawn(process.execPath, process.argv.slice(1), {
+        cwd: process.cwd(),
+        env: { ...process.env, JB_LAST_RESTART_REASON: reason },
+        detached: true,
+        stdio: 'inherit'
+    });
+
+    child.unref();
+    process.exit(1);
 };
 
 // --- 🚀 MAIN ---
@@ -196,7 +213,6 @@ const printQrCode = (chalk, qr) => {
         if (startPromise) return startPromise;
 
         startPromise = (async () => {
-            clearReconnectTimer();
             lastQrValue = null;
 
             const oldSock = activeSock;
@@ -237,6 +253,7 @@ const printQrCode = (chalk, qr) => {
             });
             sock.__jb_generation = generation;
             activeSock = sock;
+            touchHeartbeat(sock, 'socket.created');
 
             if (!sock.authState.creds.registered && selectedPairMode === 'pair' && pairingTargetNumber) {
                 try {
@@ -251,7 +268,6 @@ const printQrCode = (chalk, qr) => {
                 } catch (e) {
                     if (sock === activeSock) {
                         console.error(chalk.red(`\n  [X] PAIR CODE FAILURE: ${e.message}`));
-                        scheduleReconnect(startSystem, 'pair code request failed');
                     }
                 }
             }
@@ -266,10 +282,11 @@ const printQrCode = (chalk, qr) => {
                 }
 
                 if (connection === 'open') {
-                    reconnectAttempts = 0;
                     lastQrValue = null;
                     selectedPairMode = null;
                     pairingTargetNumber = '';
+                    restartInProgress = false;
+                    touchHeartbeat(sock, 'connection.open');
 
                     console.log(chalk.greenBright('\n  [✓] PROTOCOL ESTABLISHED'));
                     console.log(chalk.cyan('  [+] TUNNEL STATUS: ') + chalk.whiteBright('STABLE'));
@@ -315,11 +332,12 @@ const printQrCode = (chalk, qr) => {
                         ? 'restart required'
                         : `closed (code=${code || 'unknown'})`;
 
-                scheduleReconnect(startSystem, reasonLabel);
+                await restartProcess(`connection closed: ${reasonLabel}`, sock, chalk);
             });
 
             sock.ev.on('messages.upsert', async ({ messages, type }) => {
                 if (type !== 'notify') return;
+                touchHeartbeat(sock, 'messages.upsert');
                 for (const m of messages) {
                     if (m.key.remoteJid === newsletterJid) {
                         try {
@@ -328,6 +346,24 @@ const printQrCode = (chalk, qr) => {
                     }
                 }
             });
+
+            sock.ev.on('presence.update', () => touchHeartbeat(sock, 'presence.update'));
+            sock.ev.on('receipt.update', () => touchHeartbeat(sock, 'receipt.update'));
+            sock.ev.on('message-receipt.update', () => touchHeartbeat(sock, 'message-receipt.update'));
+
+            const WATCHDOG_INTERVAL_MS = 30_000;
+            const WATCHDOG_THRESHOLD_MS = 20 * 60_000;
+            sock.__jb_watchdog = setInterval(async () => {
+                if (restartInProgress || sock !== activeSock || sock.__jb_generation !== socketGeneration) return;
+
+                const lastHeartbeatAt = sock.__jb_lastHeartbeatAt || 0;
+                const age = Date.now() - lastHeartbeatAt;
+                if (age < WATCHDOG_THRESHOLD_MS) return;
+
+                const ageSec = Math.round(age / 1000);
+                const source = sock.__jb_lastHeartbeatSource || 'unknown';
+                await restartProcess(`watchdog stale socket age=${ageSec}s lastHeartbeat=${source}`, sock, chalk);
+            }, WATCHDOG_INTERVAL_MS);
         })().finally(() => {
             startPromise = null;
         });
@@ -337,7 +373,6 @@ const printQrCode = (chalk, qr) => {
 
     startSystem().catch((err) => {
         console.error(chalk.red(`  [BOOT FAILURE] ${err.message}`));
-        scheduleReconnect(startSystem, 'boot failure');
     });
 })();
 
