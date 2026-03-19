@@ -3,6 +3,7 @@ const path = require('path');
 const axios = require('axios');
 const { spawn } = require('child_process');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
+const { jidNormalizedUser } = require('@whiskeysockets/baileys');
 
 // --- CONFIG ---
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
@@ -203,12 +204,55 @@ async function generateVoice(text) {
     }
 }
 
-async function handleChatbot(conn, mek, { body, from, pushName, senderNumber, mtype, downloadMedia }) {
+function buildChatTargets(from, senderJid, senderNumber) {
+    const candidates = [
+        jidNormalizedUser(from || ''),
+        jidNormalizedUser(senderJid || ''),
+        senderNumber ? `${senderNumber}@s.whatsapp.net` : ''
+    ];
+
+    return [...new Set(candidates.filter(Boolean))];
+}
+
+async function tryWithChatTargets(targets, fn) {
+    let lastError;
+
+    for (const target of targets) {
+        try {
+            return await fn(target);
+        } catch (error) {
+            lastError = error;
+            const detail = String(error?.response?.data?.error?.message || error?.message || '');
+            if (!detail.toLowerCase().includes('user not found')) {
+                throw error;
+            }
+        }
+    }
+
+    throw lastError || new Error('User not found');
+}
+
+async function updatePresence(conn, targets, state) {
+    try {
+        await tryWithChatTargets(targets, (target) => conn.sendPresenceUpdate(state, target));
+    } catch (error) {
+        const detail = String(error?.response?.data?.error?.message || error?.message || '');
+        if (!detail.toLowerCase().includes('user not found')) {
+            throw error;
+        }
+    }
+}
+
+async function handleChatbot(conn, mek, { body, from, pushName, senderJid, senderNumber, mtype, downloadMedia }) {
     if (!JAILBREAK_ENABLED) return;
     if (!OPENROUTER_API_KEY || !from || !body) return;
 
+    const chatTargets = buildChatTargets(from, senderJid, senderNumber);
+    if (!chatTargets.length) return;
+    const primaryChat = chatTargets[0];
+
     // Inbox Only
-    if (from.endsWith('@g.us')) return; 
+    if (primaryChat.endsWith('@g.us')) return; 
     if (mek.key.fromMe) return;
 
     try {
@@ -217,7 +261,7 @@ async function handleChatbot(conn, mek, { body, from, pushName, senderNumber, mt
 
         // --- ⏳ DELAY & PRESENCE ⏳ ---
         const randomDelay = Math.floor(Math.random() * (9000 - 4000 + 1)) + 4000;
-        await conn.sendPresenceUpdate("recording", from);
+        await updatePresence(conn, chatTargets, "recording");
 
         // --- 🧠 AI LOGIC 🧠 ---
         // Using openrouter/aurora-alpha with reasoning enabled
@@ -263,7 +307,7 @@ async function handleChatbot(conn, mek, { body, from, pushName, senderNumber, mt
         
         if (!aiText) {
             console.error("[JB ERROR] Empty content from Aurora Alpha");
-            await conn.sendPresenceUpdate("paused", from);
+            await updatePresence(conn, chatTargets, "paused");
             return;
         }
 
@@ -278,13 +322,13 @@ async function handleChatbot(conn, mek, { body, from, pushName, senderNumber, mt
         await sleep(randomDelay);
 
         if (voiceBuffer) {
-            await conn.sendMessage(from, { 
+            await tryWithChatTargets(chatTargets, (target) => conn.sendMessage(target, { 
                 audio: voiceBuffer, 
                 mimetype: 'audio/ogg; codecs=opus', 
                 ptt: true 
-            }, { quoted: mek });
+            }, { quoted: mek }));
         } else {
-            await conn.sendMessage(from, { 
+            await tryWithChatTargets(chatTargets, (target) => conn.sendMessage(target, { 
                 text: aiText,
                 contextInfo: {
                     externalAdReply: {
@@ -295,15 +339,15 @@ async function handleChatbot(conn, mek, { body, from, pushName, senderNumber, mt
                         mediaType: 1
                     }
                 }
-            }, { quoted: mek });
+            }, { quoted: mek }));
         }
         
-        await conn.sendPresenceUpdate("paused", from);
+        await updatePresence(conn, chatTargets, "paused");
 
     } catch (err) {
         const errorDetail = err.response?.data?.error?.message || err.message;
         console.error("JB Bot AI Error:", errorDetail);
-        await conn.sendPresenceUpdate("paused", from);
+        await updatePresence(conn, chatTargets, "paused");
     }
 }
 
