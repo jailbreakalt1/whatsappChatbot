@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { getContentType, downloadMediaMessage, jidNormalizedUser } = require('@whiskeysockets/baileys');
 const { handleChatbot } = require('./plugins/chatbot.js');
 
 const prefix = process.env.PREFIX || '.';
@@ -16,7 +17,6 @@ const jbContext = {
     }
 };
 
-const dynamicImport = new Function('modulePath', 'return import(modulePath)');
 const sanitizeNumberDigits = (x = '') => String(x).replace(/\D/g, '');
 
 const commands = [];
@@ -41,13 +41,6 @@ function registerCommand(info, func) {
 }
 
 const bindEvents = async (conn, chalk) => {
-    let baileys;
-    try {
-        baileys = await dynamicImport('@whiskeysockets/baileys');
-    } catch (e) {}
-
-    const { getContentType, downloadMediaMessage } = baileys || {};
-
     const pluginDir = path.join(__dirname, 'plugins');
     if (fs.existsSync(pluginDir)) {
         commands.length = 0;
@@ -86,9 +79,9 @@ const bindEvents = async (conn, chalk) => {
             try {
                 if (!mek?.message || !mek?.key) continue;
 
-                const from = mek.key.remoteJid;
+                const from = jidNormalizedUser(mek.key.remoteJid || '');
                 const isGroup = from.endsWith('@g.us');
-                const senderJid = mek.key.participant || mek.key.remoteJid;
+                const senderJid = jidNormalizedUser(mek.key.participant || mek.key.remoteJid || '');
                 const senderNumber = sanitizeNumberDigits(senderJid.split('@')[0]);
                 const isOwner = ownerNumbers.includes(senderNumber) || mek.key.fromMe;
                 const pushName = mek.pushName || 'User';
@@ -124,6 +117,7 @@ const bindEvents = async (conn, chalk) => {
                         body,
                         from,
                         pushName,
+                        senderJid,
                         senderNumber,
                         mtype,
                         downloadMedia: () => downloadMediaMessage(mek, 'buffer', {}, { logger: console })
